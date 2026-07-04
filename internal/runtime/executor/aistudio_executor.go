@@ -183,7 +183,11 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 	if wsResp.Status < 200 || wsResp.Status >= 300 {
 		return resp, statusErr{code: wsResp.Status, msg: string(wsResp.Body)}
 	}
-	reporter.Publish(ctx, helps.ParseGeminiUsage(wsResp.Body))
+	if detail, ok := helps.ParseGeminiUsage(wsResp.Body); ok {
+		reporter.Publish(ctx, detail)
+	} else {
+		reporter.EnsurePublished(ctx)
+	}
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, body.toFormat, responseFormat, req.Model, opts.OriginalRequest, translatedReq, wsResp.Body, &param)
@@ -290,6 +294,7 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func(first wsrelay.StreamEvent) {
 		defer close(out)
+		defer reporter.EnsurePublished(ctx)
 		responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 		var param any
 		metadataLogged := false
@@ -348,7 +353,9 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 						return false
 					}
 				}
-				reporter.Publish(ctx, helps.ParseGeminiUsage(event.Payload))
+				if detail, ok := helps.ParseGeminiUsage(event.Payload); ok {
+					reporter.Publish(ctx, detail)
+				}
 				return false
 			case wsrelay.MessageTypeError:
 				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)

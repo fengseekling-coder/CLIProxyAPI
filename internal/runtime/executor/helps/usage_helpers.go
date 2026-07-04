@@ -3,6 +3,8 @@ package helps
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -38,7 +40,17 @@ type UsageReporter struct {
 	ttft         time.Duration
 	ttftStart    time.Time
 	ttftSet      bool
-	once         sync.Once
+
+	// stateMu guards published / failure flags. The first publish sets
+	// `published=true` and the detail it observed; a later failure that arrives
+	// after a non-zero token publish upgrades the failure flag and emits a
+	// second record so downstream dashboards don't silently lose the failure.
+	// See publishWithOutcome + ensurePublishedForOutcome for the actual logic.
+	stateMu        sync.Mutex
+	published      bool
+	publishedDetail usage.Detail
+	publishedFailed bool
+	publishedFail   usage.Failure
 }
 
 type usageExecutor interface {
@@ -87,11 +99,61 @@ func ExecutorTypeName(executor any) string {
 	for executorType.Kind() == reflect.Pointer {
 		executorType = executorType.Elem()
 	}
-	return strings.TrimSpace(executorType.Name())
+	name := strings.TrimSpace(executorType.Name())
+	if name == "" || name == "struct {}" {
+		// Anonymous funcs / closures / unexported types fall back to the
+		// provider identifier so downstream dashboards still get a stable
+		// label. If the executor implements a static Provider() method, prefer
+		// that.
+		if p, ok := executor.(interface{ Provider() string }); ok {
+			if v := strings.TrimSpace(p.Provider()); v != "" {
+				return "anonymous(" + v + ")"
+			}
+		}
+		return "anonymous"
+	}
+	return name
 }
 
 func (r *UsageReporter) Publish(ctx context.Context, detail usage.Detail) {
 	r.publishWithOutcome(ctx, detail, false, usage.Failure{})
+}
+
+// PublishOpenAIChatUsage parses an OpenAI-style non-streamed usage payload and
+// publishes it. If the payload lacks any token fields, it falls back to
+// EnsurePublished so the request is still recorded as a (zero-token) row.
+func (r *UsageReporter) PublishOpenAIChatUsage(ctx context.Context, body []byte) {
+	if detail := ParseOpenAIUsage(body); hasNonZeroTokenUsage(detail) {
+		r.Publish(ctx, detail)
+		return
+	}
+	r.EnsurePublished(ctx)
+}
+
+// PublishGeminiUsage parses a Gemini-family usage payload (aistudio /
+// antigravity / vertex / plain gemini) and publishes it. Falls back to
+// EnsurePublished when the payload carries no usageMetadata.
+func (r *UsageReporter) PublishGeminiUsage(ctx context.Context, body []byte) {
+	if detail, ok := ParseGeminiUsage(body); ok {
+		r.Publish(ctx, detail)
+		return
+	}
+	if detail, ok := ParseAntigravityUsage(body); ok {
+		r.Publish(ctx, detail)
+		return
+	}
+	r.EnsurePublished(ctx)
+}
+
+// PublishCodexUsage parses a codex response.completed usage payload and
+// publishes it. Falls back to EnsurePublished when the payload carries no
+// usage.
+func (r *UsageReporter) PublishCodexUsage(ctx context.Context, body []byte) {
+	if detail, ok := ParseCodexUsage(body); ok {
+		r.Publish(ctx, detail)
+		return
+	}
+	r.EnsurePublished(ctx)
 }
 
 func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string, detail usage.Detail) {
@@ -201,19 +263,62 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 		return
 	}
 	detail = normalizeUsageDetailTotal(detail)
-	r.once.Do(func() {
+
+	r.stateMu.Lock()
+	if !r.published {
+		r.published = true
+		r.publishedDetail = detail
+		r.publishedFailed = failed
+		r.publishedFail = fail
+		r.stateMu.Unlock()
 		r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
-	})
+		return
+	}
+	alreadyFailed := r.publishedFailed
+	hasTokens := hasNonZeroTokenUsage(detail)
+	r.stateMu.Unlock()
+
+	if failed && !alreadyFailed && hasTokens {
+		r.markFailureAndRepublish(ctx, fail)
+	}
+}
+
+// markFailureAndRepublish promotes a previously-successful token record into a
+// failed record. Sinks must dedupe on (model, requested_at) for this to remain
+// idempotent; the redis queue plugin already keeps records append-only.
+func (r *UsageReporter) markFailureAndRepublish(ctx context.Context, fail usage.Failure) {
+	if r == nil {
+		return
+	}
+	r.stateMu.Lock()
+	if r.publishedFailed {
+		r.stateMu.Unlock()
+		return
+	}
+	r.publishedFailed = true
+	r.publishedFail = fail
+	detail := r.publishedDetail
+	r.stateMu.Unlock()
+	r.publishRecord(ctx, r.buildRecord(detail, true, fail))
 }
 
 func normalizeUsageDetailTotal(detail usage.Detail) usage.Detail {
 	if detail.TotalTokens == 0 {
-		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-		if total > 0 {
+		if total := computeTokenTotal(detail); total > 0 {
 			detail.TotalTokens = total
 		}
 	}
 	return detail
+}
+
+// computeTokenTotal derives a TotalTokens value from a detail by summing every
+// contributing bucket (input, output, reasoning, cache). It is used as a
+// fallback when the upstream payload omits total_tokens. CacheReadTokens is
+// included because prompt caching is an actual charge on providers like
+// Anthropic; CacheCreationTokens likewise on Anthropic + Vertex.
+func computeTokenTotal(detail usage.Detail) int64 {
+	return detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens +
+		detail.CacheReadTokens + detail.CacheCreationTokens
 }
 
 func hasNonZeroTokenUsage(detail usage.Detail) bool {
@@ -227,16 +332,28 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 }
 
 // ensurePublished guarantees that a usage record is emitted exactly once.
-// It is safe to call multiple times; only the first call wins due to once.Do.
-// This is used to ensure request counting even when upstream responses do not
-// include any usage fields (tokens), especially for streaming paths.
+// It is safe to call multiple times; only the first call wins. This is used to
+// keep request counting accurate even when upstream responses do not include
+// any usage fields (tokens), especially for streaming paths.
+//
+// If the first observation carries zero tokens (typical for stream paths where
+// no final usage chunk was seen) AND no failure was raised, the record is
+// still emitted with zero tokens so dashboards see "request happened" — but a
+// subsequent PublishFailure call will upgrade that record to failed=true
+// rather than appending a second zero-token success row.
 func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 	if r == nil {
 		return
 	}
-	r.once.Do(func() {
-		r.publishRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
-	})
+	r.stateMu.Lock()
+	if r.published {
+		r.stateMu.Unlock()
+		return
+	}
+	r.published = true
+	r.publishedFailed = false
+	r.stateMu.Unlock()
+	r.publishRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
 }
 
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
@@ -555,14 +672,15 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	detail := usage.Detail{
 		InputTokens:         usageNode.Get("input_tokens").Int(),
 		OutputTokens:        usageNode.Get("output_tokens").Int(),
-		CachedTokens:        cacheReadTokens,
 		CacheReadTokens:     cacheReadTokens,
 		CacheCreationTokens: cacheCreationTokens,
 	}
-	if detail.CachedTokens == 0 {
-		detail.CachedTokens = detail.CacheCreationTokens
-	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
+	// CachedTokens is kept for backward compatibility (older reporters and the
+	// redisqueue JSON wire format still rely on it). Semantically it reflects
+	// "cache read" hits only — CacheCreation is intentionally excluded so that
+	// downstream dashboards do not confuse a fresh cache write with a cache hit.
+	detail.CachedTokens = cacheReadTokens
+	detail.TotalTokens = computeTokenTotal(detail)
 	return detail
 }
 
@@ -575,21 +693,25 @@ func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 		CachedTokens:    node.Get("cachedContentTokenCount").Int(),
 	}
 	if detail.TotalTokens == 0 {
-		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+		detail.TotalTokens = computeTokenTotal(detail)
 	}
 	return detail
 }
 
-func ParseGeminiUsage(data []byte) usage.Detail {
+func ParseGeminiUsage(data []byte) (usage.Detail, bool) {
 	usageNode := gjson.ParseBytes(data)
 	node := usageNode.Get("usageMetadata")
 	if !node.Exists() {
 		node = usageNode.Get("usage_metadata")
 	}
 	if !node.Exists() {
-		return usage.Detail{}
+		return usage.Detail{}, false
 	}
-	return parseGeminiFamilyUsageDetail(node)
+	detail := parseGeminiFamilyUsageDetail(node)
+	if !hasNonZeroTokenUsage(detail) {
+		return usage.Detail{}, false
+	}
+	return detail, true
 }
 
 func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
@@ -617,7 +739,7 @@ func firstExistingUsageNode(root gjson.Result, paths ...string) gjson.Result {
 	return gjson.Result{}
 }
 
-func ParseAntigravityUsage(data []byte) usage.Detail {
+func ParseAntigravityUsage(data []byte) (usage.Detail, bool) {
 	usageNode := gjson.ParseBytes(data)
 	node := usageNode.Get("response.usageMetadata")
 	if !node.Exists() {
@@ -627,9 +749,13 @@ func ParseAntigravityUsage(data []byte) usage.Detail {
 		node = usageNode.Get("usage_metadata")
 	}
 	if !node.Exists() {
-		return usage.Detail{}
+		return usage.Detail{}, false
 	}
-	return parseGeminiFamilyUsageDetail(node)
+	detail := parseGeminiFamilyUsageDetail(node)
+	if !hasNonZeroTokenUsage(detail) {
+		return usage.Detail{}, false
+	}
+	return detail, true
 }
 
 func ParseAntigravityStreamUsage(line []byte) (usage.Detail, bool) {
@@ -650,11 +776,22 @@ func ParseAntigravityStreamUsage(line []byte) (usage.Detail, bool) {
 	return parseGeminiFamilyUsageDetail(node), true
 }
 
-var stopChunkWithoutUsage sync.Map
+// stopChunkWithoutUsage correlates stream "stop" chunks that arrive without
+// usageMetadata with the next chunk that DOES carry usageMetadata so we can
+// leave both untouched (terminal chunks are not stripped). The map is bounded
+// by both a hard cap and a TTL: traceIDs are stored as a short hex hash and
+// dropped after 10 minutes, so memory cannot grow unbounded under hostile or
+// chatty upstream workloads.
+const (
+	stopChunkTTL          = 10 * time.Minute
+	stopChunkMaxEntries   = 4096
+	stopChunkHashByteLen  = 8
+)
+
+var stopChunkWithoutUsage = newBoundedStopMap(stopChunkMaxEntries)
 
 func rememberStopWithoutUsage(traceID string) {
-	stopChunkWithoutUsage.Store(traceID, struct{}{})
-	time.AfterFunc(10*time.Minute, func() { stopChunkWithoutUsage.Delete(traceID) })
+	stopChunkWithoutUsage.remember(traceID)
 }
 
 // FilterSSEUsageMetadata removes usageMetadata from SSE events that are not
@@ -685,8 +822,7 @@ func FilterSSEUsageMetadata(payload []byte) []byte {
 			continue
 		}
 		if traceID != "" {
-			if _, ok := stopChunkWithoutUsage.Load(traceID); ok && hasUsageMetadata(rawJSON) {
-				stopChunkWithoutUsage.Delete(traceID)
+			if ok := stopChunkWithoutUsage.consume(traceID); ok && hasUsageMetadata(rawJSON) {
 				continue
 			}
 		}
@@ -752,19 +888,22 @@ func StripUsageMetadataFromJSON(rawJSON []byte) ([]byte, bool) {
 		return rawJSON, false
 	}
 
-	// Remove usageMetadata from both possible locations
+	// Hide usageMetadata from downstream clients by renaming it to
+	// cpaUsageMetadata. This is a two-step rename (SetRawBytes → DeleteBytes)
+	// because sjson has no atomic "rename" primitive; doing it this way
+	// preserves nested array / object structure intact. The renamed field
+	// keeps the upstream value around for our own FilterSSEUsageMetadata
+	// correlation (see stopChunkWithoutUsage).
 	cleaned := jsonBytes
 	var changed bool
 
 	if usageMetadata = gjson.GetBytes(cleaned, "usageMetadata"); usageMetadata.Exists() {
-		// Rename usageMetadata to cpaUsageMetadata in the message_start event of Claude
 		cleaned, _ = sjson.SetRawBytes(cleaned, "cpaUsageMetadata", []byte(usageMetadata.Raw))
 		cleaned, _ = sjson.DeleteBytes(cleaned, "usageMetadata")
 		changed = true
 	}
 
 	if usageMetadata = gjson.GetBytes(cleaned, "response.usageMetadata"); usageMetadata.Exists() {
-		// Rename usageMetadata to cpaUsageMetadata in the message_start event of Claude
 		cleaned, _ = sjson.SetRawBytes(cleaned, "response.cpaUsageMetadata", []byte(usageMetadata.Raw))
 		cleaned, _ = sjson.DeleteBytes(cleaned, "response.usageMetadata")
 		changed = true
@@ -823,4 +962,96 @@ func jsonPayload(line []byte) []byte {
 		return nil
 	}
 	return trimmed
+}
+
+// boundedStopMap caps the number of "stop chunk without usage" entries and
+// expires them after a TTL. Keys are stored as a short hex digest of the
+// original traceID so attackers cannot blow up memory by sending large
+// traceIDs. The implementation is intentionally simple — a single mutex around
+// a map + a slice for FIFO eviction — because the workload is "remember an ID
+// briefly, then forget".
+type boundedStopMap struct {
+	mu      sync.Mutex
+	cap     int
+	ttl     time.Duration
+	entries map[string]time.Time
+	order   []string
+}
+
+func newBoundedStopMap(cap int) *boundedStopMap {
+	return &boundedStopMap{
+		cap:     cap,
+		ttl:     stopChunkTTL,
+		entries: make(map[string]time.Time, cap),
+		order:   make([]string, 0, cap),
+	}
+}
+
+func (b *boundedStopMap) remember(traceID string) {
+	if b == nil {
+		return
+	}
+	key := hashTraceID(traceID)
+	if key == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	if existing, ok := b.entries[key]; ok {
+		b.entries[key] = now
+		_ = existing
+		return
+	}
+	if len(b.entries) >= b.cap {
+		// FIFO evict the oldest entry to keep the cap.
+		old := b.order[0]
+		b.order = b.order[1:]
+		delete(b.entries, old)
+	}
+	b.entries[key] = now
+	b.order = append(b.order, key)
+}
+
+// consume returns true and removes the entry if it was remembered within TTL.
+// Used when a follow-up chunk carries usageMetadata and the previously-remembered
+// stop chunk should be paired with it (so we do not strip the usage chunk).
+func (b *boundedStopMap) consume(traceID string) bool {
+	if b == nil {
+		return false
+	}
+	key := hashTraceID(traceID)
+	if key == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	stored, ok := b.entries[key]
+	if !ok {
+		return false
+	}
+	if time.Since(stored) > b.ttl {
+		delete(b.entries, key)
+		return false
+	}
+	delete(b.entries, key)
+	// Remove from order slice (linear scan is fine; cap is small).
+	for i, v := range b.order {
+		if v == key {
+			b.order = append(b.order[:i], b.order[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
+// hashTraceID returns a short hex digest of the traceID. We deliberately do
+// not store the full ID to prevent hostile upstream payloads from inflating
+// the bounded map's effective memory cost.
+func hashTraceID(traceID string) string {
+	if traceID == "" {
+		return ""
+	}
+	sum := sha1.Sum([]byte(traceID))
+	return hex.EncodeToString(sum[:])[:stopChunkHashByteLen*2]
 }

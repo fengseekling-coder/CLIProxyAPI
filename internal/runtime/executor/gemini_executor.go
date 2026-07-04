@@ -203,7 +203,13 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
+	if detail, ok := helps.ParseGeminiUsage(data); ok {
+		reporter.Publish(ctx, detail)
+	} else {
+		// No usage payload — still record that the request happened so
+		// downstream quotas and dashboards see it.
+		reporter.EnsurePublished(ctx)
+	}
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, data, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}

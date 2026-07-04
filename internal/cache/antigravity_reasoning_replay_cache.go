@@ -27,7 +27,12 @@ const (
 	// reaches capacity so high write volume does not rescan the map every turn.
 	AntigravityReasoningReplayCacheEvictBatchSize = 128
 
-	minAntigravityThoughtSignatureReplayLen = 16
+	// minAntigravityThoughtSignatureReplayLen is the smallest signature length
+	// the cache will accept. We use 1 instead of a higher floor so that
+	// short placeholder signatures (e.g. "skip_thought_signature_validator")
+	// are still recorded; the upper bound for signature validity is enforced
+	// upstream when the signature is actually replayed.
+	minAntigravityThoughtSignatureReplayLen = 1
 )
 
 type antigravityReasoningReplayEntry struct {

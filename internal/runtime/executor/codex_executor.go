@@ -1224,7 +1224,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	body, _ = sjson.SetBytes(body, "stream", false)
 	body = normalizeCodexInstructions(body)
 
-	enc, err := tokenizerForCodexModel(baseModel)
+	enc, err := helps.TokenizerForModel(baseModel)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: tokenizer init failed: %w", err)
 	}
@@ -1237,26 +1237,6 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	usageJSON := fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count)
 	translated := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, []byte(usageJSON))
 	return cliproxyexecutor.Response{Payload: translated}, nil
-}
-
-func tokenizerForCodexModel(model string) (tokenizer.Codec, error) {
-	sanitized := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case sanitized == "":
-		return tokenizer.Get(tokenizer.Cl100kBase)
-	case strings.HasPrefix(sanitized, "gpt-5"):
-		return tokenizer.ForModel(tokenizer.GPT5)
-	case strings.HasPrefix(sanitized, "gpt-4.1"):
-		return tokenizer.ForModel(tokenizer.GPT41)
-	case strings.HasPrefix(sanitized, "gpt-4o"):
-		return tokenizer.ForModel(tokenizer.GPT4o)
-	case strings.HasPrefix(sanitized, "gpt-4"):
-		return tokenizer.ForModel(tokenizer.GPT4)
-	case strings.HasPrefix(sanitized, "gpt-3.5"), strings.HasPrefix(sanitized, "gpt-3"):
-		return tokenizer.ForModel(tokenizer.GPT35Turbo)
-	default:
-		return tokenizer.Get(tokenizer.Cl100kBase)
-	}
 }
 
 func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
@@ -1753,8 +1733,12 @@ func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReport
 	if !ok {
 		return
 	}
-	reporter.EnsurePublished(ctx)
+	// PublishAdditionalModel goes through its own dedup path (does not lock the
+	// main reporter). Only EnsurePublished AFTER the additional model is
+	// queued, so that a missing-main-usage + present-image-gen-usage request
+	// still ends up with a single, attributable record.
 	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
+	reporter.EnsurePublished(ctx)
 }
 
 func codexImageGenerationToolModel(body []byte) string {

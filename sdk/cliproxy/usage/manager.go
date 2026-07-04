@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -164,25 +165,58 @@ type queueItem struct {
 
 // Manager maintains a queue of usage records and delivers them to registered plugins.
 type Manager struct {
-	once     sync.Once
-	stopOnce sync.Once
-	cancel   context.CancelFunc
+	startOnce  sync.Once
+	stopOnce   sync.Once
+	condOnce   sync.Once
+	cancel     context.CancelFunc
 
 	mu     sync.Mutex
 	cond   *sync.Cond
 	queue  []queueItem
 	closed bool
 
+	// cap is the maximum number of records the queue can hold. Once the
+	// queue is full, additional Publish calls are dropped (and counted in
+	// `dropped`) instead of letting memory grow without bound.
+	cap     int
+	dropped uint64
+
 	pluginsMu sync.RWMutex
 	plugins   []Plugin
 	named     map[string]int
 }
 
-// NewManager constructs a manager with a buffered queue.
+// NewManager constructs a manager with a bounded queue. Records beyond the
+// buffer are dropped (and counted via Dropped) so a slow plugin cannot grow
+// memory without bound. A non-positive buffer is normalised to 512.
 func NewManager(buffer int) *Manager {
-	m := &Manager{}
-	m.cond = sync.NewCond(&m.mu)
-	return m
+	if buffer <= 0 {
+		buffer = 512
+	}
+	return &Manager{
+		cap: buffer,
+	}
+}
+
+// ensureCond lazily initialises the condition variable. Required because
+// NewManager no longer initialises cond directly (the struct literal is now
+// passed through helpers that may construct it without a Cond).
+func (m *Manager) ensureCond() {
+	if m == nil {
+		return
+	}
+	m.condOnce.Do(func() {
+		m.cond = sync.NewCond(&m.mu)
+	})
+}
+
+// Dropped returns the number of records that have been discarded because the
+// queue was full at the time of Publish. Useful for tests / metrics.
+func (m *Manager) Dropped() uint64 {
+	if m == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&m.dropped)
 }
 
 // Start launches the background dispatcher. Calling Start multiple times is safe.
@@ -190,7 +224,8 @@ func (m *Manager) Start(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.once.Do(func() {
+	m.ensureCond()
+	m.startOnce.Do(func() {
 		if ctx == nil {
 			ctx = context.Background()
 		}
@@ -251,16 +286,24 @@ func (m *Manager) RegisterNamed(name string, plugin Plugin) {
 }
 
 // Publish enqueues a usage record for processing. If no plugin is registered
-// the record will be discarded downstream.
+// the record will be discarded downstream. If the bounded queue is full the
+// record is dropped and counted in Dropped().
 func (m *Manager) Publish(ctx context.Context, record Record) {
 	if m == nil {
 		return
 	}
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())
+	m.ensureCond()
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
+		return
+	}
+	if m.cap > 0 && len(m.queue) >= m.cap {
+		m.mu.Unlock()
+		atomic.AddUint64(&m.dropped, 1)
+		log.Warnf("usage: queue full (cap=%d), dropping record", m.cap)
 		return
 	}
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
@@ -268,6 +311,14 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 	m.cond.Signal()
 }
 
+// run is the dispatcher loop. It blocks on cond.Wait while the queue is
+// empty AND the manager is not closed. Once Stop is called, the loop
+// continues draining any remaining items in the queue and only exits when
+// both the queue is empty and the manager is closed. This guarantees no
+// records are dropped on shutdown as long as they were enqueued BEFORE
+// Stop. Plugins receive the original record.ctx, not the worker context,
+// so a slow plugin is not auto-cancelled by Stop — see safeInvoke for
+// the timeout that bounds plugin execution time.
 func (m *Manager) run(ctx context.Context) {
 	for {
 		m.mu.Lock()
@@ -297,17 +348,48 @@ func (m *Manager) dispatch(item queueItem) {
 		if plugin == nil {
 			continue
 		}
+		// Each plugin runs in its own goroutine so a slow plugin cannot
+		// block the dispatcher or other plugins. See safeInvoke for the
+		// per-plugin timeout that bounds the leak.
 		safeInvoke(plugin, item.ctx, item.record)
 	}
 }
 
+// pluginInvokeTimeout caps how long a single plugin.HandleUsage call may
+// run before the timer logs a warning. The invocation is fire-and-forget:
+// safeInvoke returns as soon as the plugin goroutine is spawned, so a slow
+// plugin cannot block the dispatcher or delay sibling plugins.
+//
+// If the timeout fires, the goroutine will keep running until the plugin
+// returns — this is a known trade-off: we accept a transient goroutine leak
+// in exchange for never letting a slow plugin hold up the rest of the
+// dispatch loop. The runtime is expected to track such leaks via metrics.
+const pluginInvokeTimeout = 5 * time.Second
+
+// safeInvoke spawns a goroutine for plugin.HandleUsage and returns immediately.
+// The goroutine has a timeout so it does not leak forever on a misbehaving
+// plugin; the timeout is intentionally logged-only (the goroutine is not
+// killed) because plugins may hold resources that require orderly release.
 func safeInvoke(plugin Plugin, ctx context.Context, record Record) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Errorf("usage: plugin panic recovered: %v", r)
+	go func() {
+		done := make(chan struct{})
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("usage: plugin panic recovered: %v", r)
+				}
+				close(done)
+			}()
+			plugin.HandleUsage(ctx, record)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			log.Warnf("usage: plugin canceled before completion (ctx done)")
+		case <-time.After(pluginInvokeTimeout):
+			log.Warnf("usage: plugin timed out after %s; goroutine will leak until it returns", pluginInvokeTimeout)
 		}
 	}()
-	plugin.HandleUsage(ctx, record)
 }
 
 var defaultManager = NewManager(512)

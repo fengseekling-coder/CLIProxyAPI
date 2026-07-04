@@ -112,14 +112,112 @@ func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
 	}
 }
 
-func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
+func TestParseClaudeUsageCacheCreationGoesToTotalButNotCachedTokens(t *testing.T) {
+	// F3 clarified the semantic: CachedTokens reflects cache HITS only.
+	// CacheCreationTokens is its own bucket and still counts toward Total.
 	data := []byte(`{"usage":{"input_tokens":3085,"output_tokens":253,"cache_creation_input_tokens":19514}}`)
 	detail := ParseClaudeUsage(data)
-	if detail.CachedTokens != 19514 {
-		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 19514)
+	if detail.CachedTokens != 0 {
+		t.Fatalf("cached tokens = %d, want 0 (cache_creation is not a cache hit)", detail.CachedTokens)
 	}
-	if detail.TotalTokens != 22852 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 22852)
+	if detail.CacheCreationTokens != 19514 {
+		t.Fatalf("cache creation tokens = %d, want %d", detail.CacheCreationTokens, 19514)
+	}
+	// Total = input + output + cache_creation (no cache_read in this payload)
+	wantTotal := int64(3085 + 253 + 19514)
+	if detail.TotalTokens != wantTotal {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, wantTotal)
+	}
+}
+
+func TestNormalizeUsageDetailTotalIncludesCacheTokens(t *testing.T) {
+	// F1 regression: when a record comes in with TotalTokens=0 but carries
+	// cache tokens, the fallback should include cache so downstream sums
+	// remain accurate.
+	detail := normalizeUsageDetailTotal(usage.Detail{
+		InputTokens:         1,
+		CacheReadTokens:     2,
+		CacheCreationTokens: 3,
+	})
+	if detail.TotalTokens != 6 {
+		t.Fatalf("total tokens = %d, want 6 (input+cache_read+cache_creation)", detail.TotalTokens)
+	}
+}
+
+func TestParseGeminiUsageReturnsFalseWhenMissingUsageMetadata(t *testing.T) {
+	// F15: callers now check the bool to avoid publishing 0-token ghost rows.
+	data := []byte(`{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`)
+	if _, ok := ParseGeminiUsage(data); ok {
+		t.Fatalf("ParseGeminiUsage should return ok=false when usageMetadata is missing")
+	}
+}
+
+func TestParseGeminiUsageReturnsFalseWhenAllZeroTokens(t *testing.T) {
+	data := []byte(`{"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}`)
+	if _, ok := ParseGeminiUsage(data); ok {
+		t.Fatalf("ParseGeminiUsage should return ok=false when usageMetadata has no billable tokens")
+	}
+}
+
+func TestParseGeminiUsageReturnsTrueWithRealTokens(t *testing.T) {
+	data := []byte(`{"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":7,"totalTokenCount":10}}`)
+	detail, ok := ParseGeminiUsage(data)
+	if !ok {
+		t.Fatalf("ParseGeminiUsage returned ok=false on a valid payload")
+	}
+	if detail.InputTokens != 3 || detail.OutputTokens != 7 || detail.TotalTokens != 10 {
+		t.Fatalf("ParseGeminiUsage detail = %+v, want input=3, output=7, total=10", detail)
+	}
+}
+
+func TestParseAntigravityUsageHonorsBool(t *testing.T) {
+	if _, ok := ParseAntigravityUsage([]byte(`{"response":{"candidates":[]}}`)); ok {
+		t.Fatalf("ParseAntigravityUsage should return ok=false when usageMetadata is missing")
+	}
+	detail, ok := ParseAntigravityUsage([]byte(`{"response":{"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":5,"totalTokenCount":9}}}`))
+	if !ok {
+		t.Fatalf("ParseAntigravityUsage returned ok=false on a valid payload")
+	}
+	if detail.TotalTokens != 9 {
+		t.Fatalf("detail.TotalTokens = %d, want 9", detail.TotalTokens)
+	}
+}
+
+func TestBoundedStopMapHonorsTTLAndCap(t *testing.T) {
+	b := newBoundedStopMap(2)
+	b.remember("trace-a")
+	b.remember("trace-b")
+	b.remember("trace-c") // evicts oldest
+	if b.consume("trace-a") {
+		t.Fatalf("trace-a should have been evicted by cap")
+	}
+	if !b.consume("trace-b") {
+		t.Fatalf("trace-b should still be present")
+	}
+	if !b.consume("trace-c") {
+		t.Fatalf("trace-c should still be present")
+	}
+}
+
+func TestBoundedStopMapKeysAreHashed(t *testing.T) {
+	b := newBoundedStopMap(8)
+	b.remember("trace-X")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.entries["trace-X"]; ok {
+		t.Fatalf("traceID should be hashed, not stored verbatim")
+	}
+}
+
+func TestHasNonZeroTokenUsageTreatsCacheReadAndCacheCreation(t *testing.T) {
+	if !hasNonZeroTokenUsage(usage.Detail{CacheReadTokens: 1}) {
+		t.Fatalf("CacheReadTokens should make the detail non-zero")
+	}
+	if !hasNonZeroTokenUsage(usage.Detail{CacheCreationTokens: 1}) {
+		t.Fatalf("CacheCreationTokens should make the detail non-zero")
+	}
+	if hasNonZeroTokenUsage(usage.Detail{}) {
+		t.Fatalf("all-zero detail should be treated as zero")
 	}
 }
 

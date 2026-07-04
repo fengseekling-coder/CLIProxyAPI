@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"strings"
 	"time"
@@ -69,11 +70,30 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 //
 // Returns:
 //   - *http.Transport: A configured transport, or nil if the proxy URL is invalid
+//
+// Patch 2026-07-04: We force `ForceAttemptHTTP2 = false` and wipe the
+// `TLSNextProto` map so the transport speaks only HTTP/1.1 to upstreams.
+// This is a workaround for upstream Issue #3418: providers that insist on
+// HTTP/2 (e.g. www.inroi.shop, which rejects `h2`-less clients but still
+// trips Go's frame parser when responses arrive) return raw HTTP/2 frames
+// that cli-proxy-api's `http.DefaultTransport` cannot parse, surfacing as
+// `malformed HTTP response "\x00\x00\x12\x04..."` to the caller. The
+// fallback executor (uTLS) for Claude/Codex already pins HTTP/1.1
+// (PR #4012); this brings openai-compatibility to parity. All our
+// openai-compatibility upstreams work fine over HTTP/1.1 (ark, ollama,
+// inroi.shop). When Issue #3418 is fixed upstream, drop this block.
 func buildProxyTransport(proxyURL string) *http.Transport {
 	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
 	if errBuild != nil {
 		log.Errorf("%v", errBuild)
 		return nil
+	}
+	if transport != nil {
+		transport.ForceAttemptHTTP2 = false
+		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		if transport.TLSClientConfig != nil {
+			transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		}
 	}
 	return transport
 }

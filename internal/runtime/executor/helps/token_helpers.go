@@ -9,14 +9,18 @@ import (
 )
 
 // TokenizerForModel returns a tokenizer codec suitable for an OpenAI-style model id.
+// It is shared between the OpenAI compatibility executor and the Codex executor so
+// that pre-check token counts on the same query stay consistent across paths.
+// Claude / Gemini / etc. fall through to the O200kBase approximation; this is
+// documented as an estimate, not a provider-exact count.
 func TokenizerForModel(model string) (tokenizer.Codec, error) {
 	sanitized := strings.ToLower(strings.TrimSpace(model))
 	switch {
 	case sanitized == "":
 		return tokenizer.Get(tokenizer.Cl100kBase)
-	case strings.HasPrefix(sanitized, "gpt-5"):
-		return tokenizer.ForModel(tokenizer.GPT5)
 	case strings.HasPrefix(sanitized, "gpt-5.1"):
+		return tokenizer.ForModel(tokenizer.GPT5)
+	case strings.HasPrefix(sanitized, "gpt-5"):
 		return tokenizer.ForModel(tokenizer.GPT5)
 	case strings.HasPrefix(sanitized, "gpt-4.1"):
 		return tokenizer.ForModel(tokenizer.GPT41)
@@ -69,9 +73,15 @@ func CountOpenAIChatTokens(enc tokenizer.Codec, payload []byte) (int64, error) {
 	return int64(count), nil
 }
 
-// BuildOpenAIUsageJSON returns a minimal usage structure understood by downstream translators.
+// BuildOpenAIUsageJSON returns a minimal usage structure understood by downstream
+// translators. The `prompt_tokens_details.cached_tokens` field is included as 0
+// so that consumers (Cursor, Cline, Aider) can recognize this as an estimate
+// rather than an upstream-billed prompt_tokens value.
 func BuildOpenAIUsageJSON(count int64) []byte {
-	return []byte(fmt.Sprintf(`{"usage":{"prompt_tokens":%d,"completion_tokens":0,"total_tokens":%d}}`, count, count))
+	return []byte(fmt.Sprintf(
+		`{"usage":{"prompt_tokens":%d,"completion_tokens":0,"total_tokens":%d,"prompt_tokens_details":{"cached_tokens":0}}}`,
+		count, count,
+	))
 }
 
 func collectOpenAIMessages(messages gjson.Result, segments *[]string) {

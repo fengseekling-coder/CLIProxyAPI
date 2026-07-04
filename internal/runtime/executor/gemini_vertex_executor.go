@@ -420,7 +420,11 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		return resp, errRead
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
+	if detail, ok := helps.ParseGeminiUsage(data); ok {
+		reporter.Publish(ctx, detail)
+	} else {
+		reporter.EnsurePublished(ctx)
+	}
 
 	// For Imagen models, convert response to Gemini format before translation
 	// This ensures Imagen responses use the same format as gemini-3-pro-image-preview
@@ -545,7 +549,11 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 		return resp, errRead
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-	reporter.Publish(ctx, helps.ParseGeminiUsage(data))
+	if detail, ok := helps.ParseGeminiUsage(data); ok {
+		reporter.Publish(ctx, detail)
+	} else {
+		reporter.EnsurePublished(ctx)
+	}
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, data, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
@@ -658,6 +666,9 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("vertex executor: close response body error: %v", errClose)
 			}
+			// Even if no usage chunk was observed, the request itself happened
+			// and downstream quotas need to see it.
+			reporter.EnsurePublished(ctx)
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, streamScannerBuffer)
@@ -803,6 +814,9 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("vertex executor: close response body error: %v", errClose)
 			}
+			// Even if no usage chunk was observed, the request itself happened
+			// and downstream quotas need to see it.
+			reporter.EnsurePublished(ctx)
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, streamScannerBuffer)

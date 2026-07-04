@@ -73,7 +73,18 @@ func Parse(raw string) (Setting, error) {
 
 func cloneDefaultTransport() *http.Transport {
 	if transport, ok := http.DefaultTransport.(*http.Transport); ok && transport != nil {
-		return transport.Clone()
+		clone := transport.Clone()
+		// Patch 2026-07-04: pin every transport we hand out to HTTP/1.1.
+		// See `helps/proxy_helpers.go` buildProxyTransport for the full
+		// rationale; we apply the same fix here so RoundTripperFor() (the
+		// priority-3 path in helps.NewProxyAwareHTTPClient) gets the same
+		// protection without duplicating the patch in two places.
+		clone.ForceAttemptHTTP2 = false
+		clone.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		if clone.TLSClientConfig != nil {
+			clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		}
+		return clone
 	}
 	return &http.Transport{}
 }

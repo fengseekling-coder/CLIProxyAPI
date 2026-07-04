@@ -34,7 +34,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	}
 
 	// Convert input messages to Gemini contents format
-	if input := root.Get("input"); input.Exists() && input.IsArray() {
+		if input := root.Get("input"); input.Exists() && input.IsArray() {
 		items := input.Array()
 
 		// Normalize consecutive function calls and outputs so each call is immediately followed by its response
@@ -112,11 +112,11 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 		}
 
 		for _, item := range normalized {
-			itemType := item.Get("type").String()
-			itemRole := item.Get("role").String()
-			if itemType == "" && itemRole != "" {
-				itemType = "message"
-			}
+		itemType := item.Get("type").String()
+		itemRole := item.Get("role").String()
+		if itemType == "" && itemRole != "" {
+			itemType = "message"
+		}
 
 			switch itemType {
 			case "message":
@@ -372,11 +372,26 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 	// Gemini/Vertex accepts assistant/model turns in history, but some model
 	// surfaces reject requests whose final turn is model-authored prefill.
+	// We only strip a trailing model turn that carries plain text (e.g. a
+	// prefill). Model turns that include a thoughtSignature or functionCall
+	// carry reasoning/tool state that downstream calls depend on, so they
+	// must be preserved.
 	contents := gjson.GetBytes(out, "contents")
 	if contents.Exists() && contents.IsArray() {
 		arr := contents.Array()
 		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" {
-			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+			last := arr[len(arr)-1]
+			hasState := false
+			last.Get("parts").ForEach(func(_, part gjson.Result) bool {
+				if part.Get("thoughtSignature").Exists() || part.Get("functionCall").Exists() {
+					hasState = true
+					return false
+				}
+				return true
+			})
+			if !hasState {
+				out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+			}
 		}
 	}
 

@@ -240,6 +240,8 @@ func popRedisQueueItems(channel string, count int) ([][]byte, bool) {
 	switch strings.ToLower(strings.TrimSpace(channel)) {
 	case redisUsageChannel:
 		return redisqueue.PopOldest(count), true
+	case redisErrorsChannel:
+		return redisqueue.PopOldestErrors(count), true
 	default:
 		return nil, false
 	}

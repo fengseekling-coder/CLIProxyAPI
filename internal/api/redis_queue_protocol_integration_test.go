@@ -508,9 +508,14 @@ func TestRedisProtocol_AUTH_And_PopContracts(t *testing.T) {
 	if errWrite := writeTestRESPCommand(conn, "RPOP", "errors", "2"); errWrite != nil {
 		t.Fatalf("failed to write RPOP errors count command: %v", errWrite)
 	}
-	if msg, errRead := readTestRESPError(reader); errRead != nil {
-		t.Fatalf("failed to read RPOP errors response: %v", errRead)
-	} else if msg != "ERR unsupported channel 'errors'" {
-		t.Fatalf("unexpected RPOP errors response: %q", msg)
+	// F23: errors channel is now pop-able. Enqueue an error first so the
+	// queue is non-empty, then verify RPOP returns the buffered error.
+	redisqueue.EnqueueError([]byte("queued-error"))
+	errItemsPop, errPop := readRESPArrayOfBulkStrings(reader)
+	if errPop != nil {
+		t.Fatalf("failed to read RPOP errors response: %v", errPop)
+	}
+	if len(errItemsPop) != 1 || string(errItemsPop[0]) != "queued-error" {
+		t.Fatalf("unexpected RPOP errors response: %q", errItemsPop)
 	}
 }

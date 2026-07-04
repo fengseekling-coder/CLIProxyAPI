@@ -106,8 +106,11 @@ func TestBuildHTTPTransportHTTPProxy(t *testing.T) {
 	}
 
 	defaultTransport := mustDefaultTransport(t)
-	if transport.ForceAttemptHTTP2 != defaultTransport.ForceAttemptHTTP2 {
-		t.Fatalf("ForceAttemptHTTP2 = %v, want %v", transport.ForceAttemptHTTP2, defaultTransport.ForceAttemptHTTP2)
+	// ForceAttemptHTTP2 is intentionally pinned to false in cloneDefaultTransport
+	// (see proxy.go 2026-07-04 patch); everything else should still mirror
+	// the default transport.
+	if transport.ForceAttemptHTTP2 != false {
+		t.Fatalf("ForceAttemptHTTP2 = %v, want false (HTTP/1.1 pin)", transport.ForceAttemptHTTP2)
 	}
 	if transport.IdleConnTimeout != defaultTransport.IdleConnTimeout {
 		t.Fatalf("IdleConnTimeout = %v, want %v", transport.IdleConnTimeout, defaultTransport.IdleConnTimeout)
@@ -135,8 +138,11 @@ func TestBuildHTTPTransportSOCKS5ProxyInheritsDefaultTransportSettings(t *testin
 	}
 
 	defaultTransport := mustDefaultTransport(t)
-	if transport.ForceAttemptHTTP2 != defaultTransport.ForceAttemptHTTP2 {
-		t.Fatalf("ForceAttemptHTTP2 = %v, want %v", transport.ForceAttemptHTTP2, defaultTransport.ForceAttemptHTTP2)
+	// ForceAttemptHTTP2 is intentionally pinned to false in cloneDefaultTransport
+	// (see proxy.go 2026-07-04 patch); everything else should still mirror
+	// the default transport.
+	if transport.ForceAttemptHTTP2 != false {
+		t.Fatalf("ForceAttemptHTTP2 = %v, want false (HTTP/1.1 pin)", transport.ForceAttemptHTTP2)
 	}
 	if transport.IdleConnTimeout != defaultTransport.IdleConnTimeout {
 		t.Fatalf("IdleConnTimeout = %v, want %v", transport.IdleConnTimeout, defaultTransport.IdleConnTimeout)

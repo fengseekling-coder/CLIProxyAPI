@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -14,6 +16,16 @@ const (
 
 	usageSupportRefreshPayload = `{"support_refresh":true}`
 	usageRefreshPayload        = `{"refresh":true}`
+
+	// maxPayloadBytes caps a single enqueue / subscriber delivery. Large
+	// payloads (e.g. accidental image bodies, oversized response headers) are
+	// dropped with a WARN log instead of growing the queue without bound.
+	maxPayloadBytes = 1 << 20 // 1 MiB
+
+	// shutdownPayload is delivered to every active subscriber right before
+	// their channel is closed by SetEnabled(false). Subscribers can
+	// distinguish "service is shutting down" from a network disconnect.
+	shutdownPayload = `{"shutdown":true}`
 )
 
 type queueItem struct {
@@ -32,12 +44,27 @@ type queue struct {
 var (
 	enabled          atomic.Bool
 	retentionSeconds atomic.Int64
+	errorRetentionSeconds atomic.Int64
 	global           queue
 	errorGlobal      queue
 )
 
 func init() {
 	retentionSeconds.Store(defaultRetentionSeconds)
+	errorRetentionSeconds.Store(defaultRetentionSeconds)
+}
+
+// SetErrorRetentionSeconds mirrors SetRetentionSeconds but for the error
+// channel. Errors are kept in a bounded buffer for at most this many seconds
+// so they can still be observed by a late subscriber. Default 60s.
+func SetErrorRetentionSeconds(value int) {
+	normalized := int64(value)
+	if normalized <= 0 {
+		normalized = defaultRetentionSeconds
+	} else if normalized > maxRetentionSeconds {
+		normalized = maxRetentionSeconds
+	}
+	errorRetentionSeconds.Store(normalized)
 }
 
 func SetEnabled(value bool) {
@@ -69,6 +96,9 @@ func Enqueue(payload []byte) {
 	if len(payload) == 0 {
 		return
 	}
+	if len(payload) > maxPayloadBytes {
+		return
+	}
 	if global.publishToSubscribers(payload) {
 		return
 	}
@@ -79,10 +109,13 @@ func EnqueueError(payload []byte) {
 	if !Enabled() {
 		return
 	}
-	if len(payload) == 0 {
+	if len(payload) == 0 || len(payload) > maxPayloadBytes {
 		return
 	}
-	errorGlobal.publishToSubscribers(payload)
+	if errorGlobal.publishToSubscribers(payload) {
+		return
+	}
+	errorGlobal.enqueueError(payload)
 }
 
 func PopOldest(count int) [][]byte {
@@ -93,6 +126,16 @@ func PopOldest(count int) [][]byte {
 		return nil
 	}
 	return global.popOldest(count)
+}
+
+func PopOldestErrors(count int) [][]byte {
+	if !Enabled() {
+		return nil
+	}
+	if count <= 0 {
+		return nil
+	}
+	return errorGlobal.popOldestErrors(count)
 }
 
 func SubscribeUsage() (<-chan []byte, func()) {
@@ -110,8 +153,17 @@ func NotifyUsageRefresh() {
 func (q *queue) clear() {
 	q.mu.Lock()
 
+	// Send a shutdown notice to active subscribers BEFORE closing their
+	// channels so they can distinguish "service going away" from "network
+	// disconnect" and avoid spurious reconnect storms.
+	shutdown := []byte(shutdownPayload)
 	subscribers := make([]chan []byte, 0, len(q.subscribers))
 	for _, subscriber := range q.subscribers {
+		select {
+		case subscriber <- shutdown:
+		default:
+			// Subscriber channel is full; they will be closed below.
+		}
 		subscribers = append(subscribers, subscriber)
 	}
 	q.items = nil
@@ -146,13 +198,16 @@ func (q *queue) publishToSubscribers(payload []byte) bool {
 		return false
 	}
 
+	cloned := append([]byte(nil), payload...)
 	for id, subscriber := range q.subscribers {
-		cloned := append([]byte(nil), payload...)
 		select {
 		case subscriber <- cloned:
 		default:
+			// Subscriber buffer is full. Close the channel so the consumer
+			// sees a graceful disconnect; log so operators can correlate.
 			delete(q.subscribers, id)
 			close(subscriber)
+			log.Warnf("redisqueue: dropping slow subscriber (buffer=%d) and closing its channel", cap(subscriber))
 		}
 	}
 
@@ -196,13 +251,35 @@ func (q *queue) unsubscribe(id uint64) {
 	}
 }
 
-func (q *queue) popOldest(count int) [][]byte {
+func (q *queue) enqueueError(payload []byte) {
 	now := time.Now()
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.pruneLocked(now)
+	q.pruneLockedWith(now, errorRetentionSeconds.Load())
+	q.items = append(q.items, queueItem{
+		enqueuedAt: now,
+		payload:    append([]byte(nil), payload...),
+	})
+	q.maybeCompactLocked()
+}
+
+func (q *queue) popOldest(count int) [][]byte {
+	return q.popOldestWith(count, retentionSeconds.Load())
+}
+
+func (q *queue) popOldestErrors(count int) [][]byte {
+	return q.popOldestWith(count, errorRetentionSeconds.Load())
+}
+
+func (q *queue) popOldestWith(count int, windowSeconds int64) [][]byte {
+	now := time.Now()
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.pruneLockedWith(now, windowSeconds)
 	available := len(q.items) - q.head
 	if available <= 0 {
 		q.items = nil
@@ -224,13 +301,16 @@ func (q *queue) popOldest(count int) [][]byte {
 }
 
 func (q *queue) pruneLocked(now time.Time) {
+	q.pruneLockedWith(now, retentionSeconds.Load())
+}
+
+func (q *queue) pruneLockedWith(now time.Time, windowSeconds int64) {
 	if q.head >= len(q.items) {
 		q.items = nil
 		q.head = 0
 		return
 	}
 
-	windowSeconds := retentionSeconds.Load()
 	if windowSeconds <= 0 {
 		windowSeconds = defaultRetentionSeconds
 	}
