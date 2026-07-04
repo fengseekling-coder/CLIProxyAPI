@@ -51,6 +51,23 @@ type UsageReporter struct {
 	publishedDetail usage.Detail
 	publishedFailed bool
 	publishedFail   usage.Failure
+
+	// reasoningCharsMu guards reasoningChars.
+	//
+	// Some upstreams (GLM-5, DeepSeek-R1, Qwen3-Thinking, …) emit the
+	// model's internal "thinking" tokens through a separate
+	// `choices[].delta.reasoning_content` channel and report a flat
+	// `completion_tokens` total that does not break out the reasoning
+	// portion. `usage.completion_tokens_details.reasoning_tokens` is
+	// therefore always 0 on those providers. To keep the per-model
+	// "本月 TOKEN" column in the Management Center accurate, every SSE
+	// chunk that carries a non-empty `reasoning_content` delta calls
+	// AccumulateReasoning with the byte length of the delta; Publish()
+	// folds the running total into Detail.ReasoningTokens via the
+	// charsToTokens heuristic (~4 ASCII chars / token — close enough
+	// for both CJK and Latin, since this only drives UI aggregates).
+	reasoningCharsMu sync.Mutex
+	reasoningChars   int
 }
 
 type usageExecutor interface {
@@ -262,6 +279,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	if r == nil {
 		return
 	}
+	detail = r.foldReasoningTokens(detail)
 	detail = normalizeUsageDetailTotal(detail)
 
 	r.stateMu.Lock()
@@ -281,6 +299,71 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	if failed && !alreadyFailed && hasTokens {
 		r.markFailureAndRepublish(ctx, fail)
 	}
+}
+
+// AccumulateReasoning records the byte length of a single
+// `choices[].delta.reasoning_content` SSE chunk. Streams from thinking
+// models (GLM-5, DeepSeek-R1, Qwen3-Thinking, …) funnel their internal
+// chain-of-thought through this field, but the upstream `usage` chunk
+// reports `reasoning_tokens: 0` because the platform bills the reasoning
+// pass as free. We sum the bytes here so Publish() can fold an estimated
+// reasoning token count into Detail.ReasoningTokens — without this, every
+// thinking-model request shows up in the Management Center as a content
+// row of zero tokens even when several kB of reasoning fired.
+//
+// Safe to call concurrently; the underlying counter is mutex-guarded and
+// intentionally never reset (it's monotonically accumulated between
+// Publish calls; Publish reads and folds it exactly once).
+func (r *UsageReporter) AccumulateReasoning(deltaBytes int) {
+	if r == nil || deltaBytes <= 0 {
+		return
+	}
+	r.reasoningCharsMu.Lock()
+	r.reasoningChars += deltaBytes
+	r.reasoningCharsMu.Unlock()
+}
+
+// foldReasoningTokens adds the accumulated reasoning-content byte count
+// (estimated at ~4 bytes per token, matching OpenAI's published
+// rule-of-thumb for English text) to detail.ReasoningTokens so that the
+// row in the Models page reflects the real cost of running a thinking
+// model. The estimate is intentionally conservative — CJK runs a little
+// denser than 4 bytes/token, so the displayed value is a slight
+// under-count for Chinese thinking content, but still much closer to the
+// truth than the upstream-reported zero.
+//
+// When reasoning was absent from the upstream payload (think GLM-5 /
+// DeepSeek-R1 / Qwen3-Thinking — they all report
+// `usage.completion_tokens_details.reasoning_tokens: 0` while charging
+// reasoning_content as free), the upstream `usage.total_tokens` also
+// omits the reasoning portion — so we also recompute detail.TotalTokens
+// from scratch via computeTokenTotal. Otherwise the Models page's 本月
+// TOKEN column would understate the real spend by the entire reasoning
+// bucket (e.g. for the GLM-5.2 "黑洞信息悖论" probe earlier today the
+// upstream total was 2246 but the actual token spend was 2246 + 1148 =
+// 3394). The same logic would be a no-op for upstreams that already
+// count reasoning in their total_tokens (OpenAI, Anthropic, Gemini);
+// computeTokenTotal is idempotent when the upstream accounting already
+// double-counts.
+func (r *UsageReporter) foldReasoningTokens(detail usage.Detail) usage.Detail {
+	if r == nil {
+		return detail
+	}
+	r.reasoningCharsMu.Lock()
+	chars := r.reasoningChars
+	r.reasoningChars = 0
+	r.reasoningCharsMu.Unlock()
+	if chars <= 0 {
+		return detail
+	}
+	const charsPerToken = 4
+	estimated := int64((chars + charsPerToken - 1) / charsPerToken)
+	if estimated <= 0 {
+		return detail
+	}
+	detail.ReasoningTokens += estimated
+	detail.TotalTokens = computeTokenTotal(detail)
+	return detail
 }
 
 // markFailureAndRepublish promotes a previously-successful token record into a

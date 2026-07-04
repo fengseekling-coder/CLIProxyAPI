@@ -22,6 +22,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -189,6 +190,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
+	reporter.AccumulateReasoning(nonStreamReasoningBytes(body))
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	// Ensure we at least record the request even if upstream doesn't return usage
 	reporter.EnsurePublished(ctx)
@@ -282,6 +284,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 		return resp, err
 	}
 
+	reporter.AccumulateReasoning(nonStreamReasoningBytes(body))
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	reporter.EnsurePublished(ctx)
 	resp = cliproxyexecutor.Response{Payload: body, Headers: httpResp.Header.Clone()}
@@ -403,6 +406,17 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			if len(trimmedLine) == 0 {
 				continue
 			}
+
+			// Thinking-only streams (GLM-5, DeepSeek-R1, Qwen3-Thinking, …)
+			// funnel internal chain-of-thought through
+			// `choices[].delta.reasoning_content` and bill it as zero
+			// tokens in the upstream usage chunk. Sum the byte length of
+			// every reasoning_content delta into the reporter so
+			// Publish() can fold an estimated reasoning token count into
+			// Detail.ReasoningTokens; without this, thinking-model
+			// requests show up as zero-token rows in the Models page even
+			// when several kB of reasoning fired.
+			reporter.AccumulateReasoning(streamingReasoningBytes(trimmedLine))
 
 			if !bytes.HasPrefix(trimmedLine, []byte("data:")) {
 				if bytes.HasPrefix(trimmedLine, []byte(":")) || bytes.HasPrefix(trimmedLine, []byte("event:")) ||
@@ -652,6 +666,71 @@ func prepareOpenAICompatImagesPayload(payload []byte, model string, contentType 
 		return nil, "", fmt.Errorf("multipart boundary is missing")
 	}
 	return rewriteOpenAICompatImagesMultipartPayload(payload, model, boundary, stream)
+}
+
+// nonStreamReasoningBytes returns the byte length of every
+// `choices[].message.reasoning_content` field present in a non-streamed
+// OpenAI-style chat completion payload. The upstream `usage` chunk reports
+// `reasoning_tokens: 0` for thinking-only models, so we read the byte length
+// of the reasoning text and hand it to UsageReporter.AccumulateReasoning
+// before Publish folds it into Detail.ReasoningTokens.
+//
+// We don't touch `choices[].message.content` here — that text is already
+// accounted for in `usage.completion_tokens`.
+func nonStreamReasoningBytes(body []byte) int {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return 0
+	}
+	choices := gjson.GetBytes(body, "choices")
+	if !choices.IsArray() {
+		return 0
+	}
+	total := 0
+	choices.ForEach(func(_, choice gjson.Result) bool {
+		raw := choice.Get("message.reasoning_content")
+		if raw.Type != gjson.String {
+			return true
+		}
+		total += len(raw.String())
+		return true
+	})
+	return total
+}
+
+// streamingReasoningBytes returns the sum of `choices[].delta.reasoning_content`
+// bytes for every choice present in a single SSE `data:` line. Lines that
+// don't start with `data:` (heartbeats, event names, [DONE]) and lines whose
+// payload isn't JSON return 0. The returned value is what the streaming loop
+// hands to UsageReporter.AccumulateReasoning.
+//
+// We deliberately ignore `choices[].delta.content` here — that field is
+// already accounted for in the upstream usage chunk. Reasoning-only upstreams
+// (GLM-5, DeepSeek-R1, Qwen3-Thinking, …) emit zero in
+// `usage.completion_tokens_details.reasoning_tokens`, so we have to estimate
+// the missing count from the byte length of the streamed reasoning text.
+func streamingReasoningBytes(sseLine []byte) int {
+	trimmed := bytes.TrimSpace(sseLine)
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return 0
+	}
+	payload := bytes.TrimSpace(trimmed[len("data:"):])
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return 0
+	}
+	choices := gjson.GetBytes(payload, "choices")
+	if !choices.IsArray() {
+		return 0
+	}
+	total := 0
+	choices.ForEach(func(_, choice gjson.Result) bool {
+		raw := choice.Get("delta.reasoning_content")
+		if raw.Type != gjson.String {
+			return true
+		}
+		total += len(raw.String())
+		return true
+	})
+	return total
 }
 
 func cloneOpenAICompatMIMEHeader(src textproto.MIMEHeader) textproto.MIMEHeader {
